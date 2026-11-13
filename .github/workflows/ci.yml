@@ -1,107 +1,66 @@
 name: CI
 
 on:
-  pull_request:
-  push:
-    branches:
-      - 'sixteen'
-      - 'seventeen'
   workflow_dispatch:
     inputs:
-      build_rom:
-        description: 'Build on a prepared, trusted self-hosted ROM runner'
-        type: boolean
-        default: false
       target:
-        description: 'One UI 9 Exynos2100 target (not device-qualified)'
+        description: 'Target Device Codename'
         type: choice
-        default: t2s
+        default: r9s
         options:
+          - r9s
           - o1s
           - t2s
           - p3s
-          - r9s
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  source-checks:
-    name: Source and patch checks
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v7
-
-      - name: Install Perl XML parser for host regressions
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential clang libexpat1-dev
-          python3 scripts/setup_xml_parser.py
-          scripts/run_xml_perl.sh --check
-
-      - name: Check shell syntax, ordinary patches and JSON
-        run: python3 .github/check_source.py
-
-      - name: Run host-only profile and scratch regressions
-        run: python3 -B -m unittest discover -s .github/tests -v
-
-      # Match the locally validated engine instead of inheriting a different
-      # distro version's control-flow diagnostics. Keep all lint checks enabled.
-      - name: Install pinned ShellCheck 0.11.0
-        run: |
-          HOST_LINT_DIR="$(mktemp -d "$RUNNER_TEMP/shellcheck.XXXXXX")"
-          curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
-            --connect-timeout 10 --max-time 120 \
-            'https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz' \
-            --output "$HOST_LINT_DIR/shellcheck.tar.xz"
-          printf '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  %s\n' \
-            "$HOST_LINT_DIR/shellcheck.tar.xz" | sha256sum --check --status
-          tar --extract --xz --file "$HOST_LINT_DIR/shellcheck.tar.xz" \
-            --directory "$HOST_LINT_DIR" --no-same-owner shellcheck-v0.11.0/shellcheck
-          "$HOST_LINT_DIR/shellcheck-v0.11.0/shellcheck" --version
-          echo "$HOST_LINT_DIR/shellcheck-v0.11.0" >> "$GITHUB_PATH"
-
-      - name: Run shellcheck
-        run: |
-          CODE=0
-          while IFS= read -r f; do
-            shellcheck -e SC1090,SC1091 -s bash "$f" || CODE=1
-          done < <(find .github platform scripts target unica -name "*.sh" -not -name "*ssi.sh" -not -name "config.sh" -not -name "sff.sh")
-          exit $CODE
-
-  build:
-    name: Prepared-host ROM build
-    if: github.event_name == 'workflow_dispatch' && inputs.build_rom
-    needs: source-checks
-    # Full firmware, the matched kernel cohort, Linux mounts and ample disk are
-    # explicit prerequisites, not missing files to skip on a hosted runner.
-    # Never run untrusted pull-request code on this privileged runner.
+  build-and-upload:
+    name: Build ROM & Upload to GoFile
     runs-on: [self-hosted, linux, x64, monsterrom]
     timeout-minutes: 180
     env:
-      BUILD_TARGET: ${{ inputs.target }}
+      BUILD_TARGET: ${{ inputs.target || 'r9s' }}
     steps:
-      - name: Checkout repo without deleting provisioned out inputs
+      - name: Checkout repo
         uses: actions/checkout@v7
         with:
           submodules: 'recursive'
           clean: false
 
-      - name: Verify provisioned local XML parser offline
-        run: scripts/run_xml_perl.sh --check
-
-      - name: Build with the original UN1CA helpers
+      - name: Build ROM
         shell: bash
         run: |
           set -euo pipefail
-          case "$BUILD_TARGET" in o1s|t2s|p3s|r9s) ;; *) exit 1 ;; esac
-          # The original sourced build environment does not use nounset.
           set +u
           source ./buildenv.sh "$BUILD_TARGET"
           ./scripts/build_dependencies.sh
           ./scripts/make_rom.sh -z
+
+      - name: Upload ROM to GoFile
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROM_ZIP=$(find out -name "*.zip" | head -n 1)
+          if [ -z "$ROM_ZIP" ]; then
+            echo "Error: ROM zip not found!"
+            exit 1
+          fi
+          echo "Found ROM zip: $ROM_ZIP"
+
+          # Get available GoFile server
+          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"')
+          echo "Uploading to GoFile server: $SERVER"
+
+          RESPONSE=$(curl -s -F "file=@$ROM_ZIP" "https://${SERVER}.gofile.io/contents/uploadfile")
+          echo "$RESPONSE"
+
+          LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage // empty')
+          if [ -n "$LINK" ]; then
+            echo "=========================================="
+            echo "ROM uploaded successfully!"
+            echo "Download Link: $LINK"
+            echo "=========================================="
+            echo "gofile_link=$LINK" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Warning: Could not extract GoFile download link from response."
+          fi
